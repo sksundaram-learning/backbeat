@@ -18,7 +18,7 @@ const sub = new Subscriber({
     zookeeper: { host: 'localhost', port: 2181 },
     log: { logLevel: 'info', dumpLevel: 'error' },
     topic: 'replication',
-    partition: 1,
+    partition: 0,
     groupId: 'crr',
 });
 
@@ -39,8 +39,6 @@ function _createRequestHeader(where, method, path, headers) {
 
 function _createRequest(reqHeaders) {
     const request = http.request(reqHeaders);
-    // disable nagle algorithm
-    request.setNoDelay(true);
     return request;
 }
 
@@ -108,25 +106,26 @@ function _processEntry(entry, cb) {
     const record = JSON.parse(entry.value);
     const mdEntry = JSON.parse(record.value);
     const object = record.key.split('\u0000')[0];
+    const bucket = record.bucket;
     waterfall([
         // get data stream from source bucket
-        next => _getData('demo', object, mdEntry.location, log, next),
+        next => _getData(bucket, object, mdEntry.location, log, next),
         // put data in target bucket
-        (stream, next) => _putData('demo', object, stream,
+        (stream, next) => _putData(bucket, object, stream,
             mdEntry['content-length'], mdEntry['content-md5'], log, next),
         // update location, replication status and put metadata in target bucket
         (locationRes, next) => {
             const destEntry = Object.assign({}, mdEntry);
             destEntry.location = JSON.parse(locationRes);
             destEntry['x-amz-replication-status'] = 'REPLICA';
-            _putMetaData('target', 'demo', object, JSON.stringify(destEntry),
-                log, next);
+            _putMetaData('target', bucket, object,
+                         JSON.stringify(destEntry), log, next);
         },
         // update rep. status to COMPLETED and put metadata in source bucket
         next => {
             mdEntry['x-amz-replication-status'] = 'COMPLETED';
-            _putMetaData('source', 'demo', object, JSON.stringify(mdEntry), log,
-                next);
+            _putMetaData('source', bucket, object,
+                         JSON.stringify(mdEntry), log, next);
         },
     ], cb);
 }
