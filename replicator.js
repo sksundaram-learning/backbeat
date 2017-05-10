@@ -64,6 +64,7 @@ function queueEntries() {
                     }
                 });
                 recordStream.on('end', () => {
+                    pub.close();
                     log.info('ending record stream');
                 });
             });

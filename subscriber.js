@@ -24,8 +24,6 @@ const sub = new Subscriber({
     groupId: 'crr',
 });
 
-const subscriberClient = sub.setClient();
-
 function _createRequestHeader(where, method, path, headers) {
     const reqHeaders = headers || {};
     const hostname = where === 'source' ? sourceHostname : targetHostname;
@@ -133,17 +131,18 @@ function _processEntry(entry, cb) {
 
 function replicateEntries() {
     log.info('starting replication....');
-    subscriberClient.read((err, entries) => {
+    sub.setClient().read((err, entries) => {
         if (err) {
             return log.error('error getting messages', err);
         }
-
+        log.info('processing entries...');
         return mapSeries(entries, _processEntry, err => {
             if (err) {
                 return log.error('error processing entries',
                     { error: err.stack || err });
             }
             sub.commit();
+            sub.close();
             return log.info('successfully processed entries',
                 { entries: entries.length });
         });
