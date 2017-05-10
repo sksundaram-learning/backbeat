@@ -111,6 +111,7 @@ function _processEntry(entry, cb) {
             mdEntry['content-length'], mdEntry['content-md5'], log, next),
         // update location, replication status and put metadata in target bucket
         (locationRes, next) => {
+            log.info('updating dest MD');
             const destEntry = Object.assign({}, mdEntry);
             destEntry.location = JSON.parse(locationRes);
             destEntry['x-amz-replication-status'] = 'REPLICA';
@@ -119,6 +120,7 @@ function _processEntry(entry, cb) {
         },
         // update rep. status to COMPLETED and put metadata in source bucket
         next => {
+            log.info('updating source MD to COMPLETED');
             mdEntry['x-amz-replication-status'] = 'COMPLETED';
             _putMetaData('source', bucket, object,
                          JSON.stringify(mdEntry), log, next);
@@ -128,6 +130,7 @@ function _processEntry(entry, cb) {
 
 
 function replicateEntries() {
+    log.info('starting replication....');
     sub.setClient().read((err, entries) => {
         if (err) {
             return log.error('error getting messages', err);
@@ -139,7 +142,8 @@ function replicateEntries() {
                     { error: err.stack || err });
             }
             sub.commit();
-            return log.info('successfully processed entries');
+            return log.info('successfully processed entries',
+                { entries: entries.length });
         });
     });
 }
