@@ -1,5 +1,7 @@
 const http = require('http');
 const async = require('async');
+const schedule = require('node-schedule');
+
 const mapSeries = async.mapSeries;
 const waterfall = async.waterfall;
 
@@ -86,17 +88,11 @@ function _putMetaData(where, bucket, object, payload, log, cb) {
     });
     const req = _createRequest(reqHeaders);
     req.write(payload);
-    req.on('response', response => {
-	const body = [];
-	let bodyLen = 0;
-        response.on('data', chunk => {
-	  body.push(chunk);
-	});
-	response.on('end', () => {
-	   console.log('res data', Buffer.concat(body, bodyLen).toString());
-	   cb();
-	});
-    });
+    // req.on('response', response => {
+    //     const body = [];
+    //     response.on('data', chunk => body.push(chunk));
+    //     response.on('end', () => cb());
+    // });
     req.on('error', cb);
     req.end();
 }
@@ -130,18 +126,22 @@ function _processEntry(entry, cb) {
     ], cb);
 }
 
-sub.setClient().read((err, entries) => {
-    if (err) {
-        return log.error('error getting messages', err);
-    }
 
-    return mapSeries(entries, _processEntry, err => {
+function replicateEntries() {
+    sub.setClient().read((err, entries) => {
         if (err) {
-            return log.error('error processing entries',
-                { error: err.stack || err });
+            return log.error('error getting messages', err);
         }
-//        sub.setOffset();
-  //      sub.commit();
-        return log.info('successfully processed entries');
+
+        return mapSeries(entries, _processEntry, err => {
+            if (err) {
+                return log.error('error processing entries',
+                    { error: err.stack || err });
+            }
+            sub.commit();
+            return log.info('successfully processed entries');
+        });
     });
-});
+}
+// schedule every 15 seconds
+schedule.scheduleJob('*/15 * * * * *', replicateEntries);
