@@ -24,6 +24,8 @@ const sub = new Subscriber({
     groupId: 'crr',
 });
 
+const subscriberClient = sub.setClient();
+
 function _createRequestHeader(where, method, path, headers) {
     const reqHeaders = headers || {};
     const hostname = where === 'source' ? sourceHostname : targetHostname;
@@ -131,7 +133,7 @@ function _processEntry(entry, cb) {
 
 function replicateEntries() {
     log.info('starting replication....');
-    sub.setClient().read((err, entries) => {
+    subscriberClient.read((err, entries) => {
         if (err) {
             return log.error('error getting messages', err);
         }
