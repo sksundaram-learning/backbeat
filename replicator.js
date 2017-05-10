@@ -1,3 +1,4 @@
+const schedule = require('node-schedule');
 const arsenal = require('arsenal');
 const Logger = require('werelogs').Logger;
 const Publisher = require('./lib/Publisher');
@@ -26,46 +27,51 @@ const LOGNAME = 'main';
 
 let lastProcessedSeq = 0;
 
-sourceMD.openRecordLog(LOGNAME, (err, logProxy) => {
-    if (err) {
-        return log.error('error fetching log stream', { error: err });
-    }
-    pub.setClient(err => {
+
+function queueEntries() {
+    sourceMD.openRecordLog(LOGNAME, (err, logProxy) => {
         if (err) {
-            return log.error('error in publisher.setClient',
-                             { error: err });
+            return log.error('error fetching log stream', { error: err });
         }
-        const readOptions = { minSeq: (lastProcessedSeq + 1) };
-        logProxy.readRecords(readOptions, (err, recordStream) => {
-            recordStream.on('data', record => {
-                const value = JSON.parse(record.value);
-                const repStatus = value['x-amz-replication-status'];
-                if (record.type === 'put' && record.key.includes('\u0000')
-                    && repStatus === 'PENDING') {
-                    const queueEntry = {
-                        type: record.type,
-                        seq: record.seq,
-                        bucket: record.prefix[0],
-                        key: record.key,
-                        value: record.value,
-                        timestamp: record.timestamp,
-                    };
-                    pub.publish(JSON.stringify(queueEntry), err => {
-                        if (err) {
-                            return log.error('error publishing entry',
-                                             { error: err });
-                        }
-                        lastProcessedSeq = record.seq;
-                        return log.info('entry published successfully');
-                    });
-                }
+        pub.setClient(err => {
+            if (err) {
+                return log.error('error in publisher.setClient',
+                                 { error: err });
+            }
+            const readOptions = { minSeq: (lastProcessedSeq + 1) };
+            logProxy.readRecords(readOptions, (err, recordStream) => {
+                recordStream.on('data', record => {
+                    const value = JSON.parse(record.value);
+                    const repStatus = value['x-amz-replication-status'];
+                    if (record.type === 'put' && record.key.includes('\u0000')
+                        && repStatus === 'PENDING') {
+                        const queueEntry = {
+                            type: record.type,
+                            seq: record.seq,
+                            bucket: record.prefix[0],
+                            key: record.key,
+                            value: record.value,
+                            timestamp: record.timestamp,
+                        };
+                        pub.publish(JSON.stringify(queueEntry), err => {
+                            if (err) {
+                                return log.error('error publishing entry',
+                                                 { error: err });
+                            }
+                            lastProcessedSeq = record.seq;
+                            return log.info('entry published successfully');
+                        });
+                    }
+                });
+                recordStream.on('end', () => {
+                    log.info('ending record stream');
+                });
             });
-            recordStream.on('end', () => {
-		log.info('ending record stream');
-//                pub.close();
-            });
+            return undefined;
         });
         return undefined;
     });
-    return undefined;
-});
+}
+
+// schedule every 5 seconds
+schedule.scheduleJob('*/10 * * * * *', queueEntries);
