@@ -10,7 +10,6 @@ const Logger = require('werelogs').Logger;
 const logger = new Logger('Backbeat:Replication');
 const log = logger.newRequestLogger();
 
-// const destEndpoint = 'http://localhost:8002';
 const sourceHostname = 'localhost';
 const sourcePort = '8000';
 const targetHostname = 'localhost';
@@ -23,6 +22,8 @@ const sub = new Subscriber({
     partition: 0,
     groupId: 'crr',
 });
+const subClient = sub.setClient();
+const httpAgent = new http.Agent({ keepAlive: true });
 
 function _createRequestHeader(where, method, path, headers) {
     const reqHeaders = headers || {};
@@ -35,7 +36,7 @@ function _createRequestHeader(where, method, path, headers) {
         method,
         path,
         headers: reqHeaders,
-        // agent: this.httpAgent,
+        agent: httpAgent,
     };
 }
 
@@ -131,7 +132,7 @@ function _processEntry(entry, cb) {
 
 function replicateEntries() {
     log.info('starting replication....');
-    sub.setClient().read((err, entries) => {
+    subClient.read((err, entries) => {
         if (err) {
             return log.error('error getting messages', err);
         }
@@ -141,10 +142,8 @@ function replicateEntries() {
                 return log.error('error processing entries',
                     { error: err.stack || err });
             }
-            sub.commit();
-            sub.close();
-            return log.info('successfully processed entries',
-                { entries: entries.length });
+            return sub.commit(() => log.info('successfully processed entries',
+                { entries: entries.length }));
         });
     });
 }
