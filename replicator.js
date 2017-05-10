@@ -6,8 +6,8 @@ const logger = new Logger('Backbeat:Replication');
 const log = logger.newRequestLogger();
 
 const sourceMD = new MetadataFileClient({
-    metadataHost: 'localhost',
-    metadataPort: '9990',
+    host: 'localhost',
+    port: '9990',
     recordLogEnabled: true,
     log: {
         logLevel: 'info',
