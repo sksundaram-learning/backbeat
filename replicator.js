@@ -20,7 +20,7 @@ const pub = new Publisher({
     zookeeper: { host: 'localhost', port: 2181 },
     log: { logLevel: 'info', dumpLevel: 'error' },
     topic: 'replication',
-    partition: 1,
+    partition: 0,
 });
 
 const LOGNAME = 'main';
@@ -60,7 +60,7 @@ function queueEntries() {
                                                  { error: err });
                             }
                             lastProcessedSeq = record.seq;
-                            return log.info('entry published successfully');
+                            return log.info('entry published successfully', { queueEntry });
                         });
                     }
                 });
@@ -75,5 +75,6 @@ function queueEntries() {
     });
 }
 
-// schedule every 10 seconds
-schedule.scheduleJob('*/3 * * * * *', queueEntries);
+// schedule every 3 seconds
+queueEntries();
+//schedule.scheduleJob('*/3 * * * * *', queueEntries);

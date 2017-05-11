@@ -19,7 +19,7 @@ const sub = new Subscriber({
     zookeeper: { host: 'localhost', port: 2181 },
     log: { logLevel: 'info', dumpLevel: 'error' },
     topic: 'replication',
-    partition: 1,
+    partition: 0,
     groupId: 'crr',
 });
 const subClient = sub.setClient();
@@ -99,11 +99,11 @@ function _putMetaData(where, bucket, object, payload, log, cb) {
 }
 
 function _processEntry(entry, cb) {
-    log.info('processing entry', { entry });
     const record = JSON.parse(entry.value);
     const mdEntry = JSON.parse(record.value);
     const object = record.key.split('\u0000')[0];
     const bucket = record.bucket;
+    log.info('processing entry', { object });
     waterfall([
         // get data stream from source bucket
         next => _getData(bucket, object, mdEntry.location, log, next),
@@ -136,7 +136,7 @@ function replicateEntries() {
         if (err) {
             return log.error('error getting messages', err);
         }
-        log.info('processing entries...');
+        log.info('processing entries...', { entriesCount: entries.length });
         return mapSeries(entries, _processEntry, err => {
             if (err) {
                 return log.error('error processing entries',
@@ -147,5 +147,6 @@ function replicateEntries() {
         });
     });
 }
-// schedule every 15 seconds
-schedule.scheduleJob('*/5 * * * * *', replicateEntries);
+// schedule every 5 seconds
+replicateEntries();
+// schedule.scheduleJob('*/5 * * * * *', replicateEntries);
