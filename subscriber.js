@@ -89,11 +89,11 @@ function _putMetaData(where, bucket, object, payload, log, cb) {
     });
     const req = _createRequest(reqHeaders);
     req.write(payload);
-    // req.on('response', response => {
-    //     const body = [];
-    //     response.on('data', chunk => body.push(chunk));
-    //     response.on('end', () => cb());
-    // });
+    req.on('response', response => {
+         const body = [];
+         response.on('data', chunk => body.push(chunk));
+         response.on('end', () => cb());
+     });
     req.on('error', cb);
     req.end();
 }
@@ -149,4 +149,4 @@ function replicateEntries() {
 }
 // schedule every 5 seconds
 replicateEntries();
-// schedule.scheduleJob('*/5 * * * * *', replicateEntries);
+//schedule.scheduleJob('*/5 * * * * *', replicateEntries);

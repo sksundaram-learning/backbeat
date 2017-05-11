@@ -75,6 +75,6 @@ function queueEntries() {
     });
 }
 
-// schedule every 3 seconds
+// schedule every 10 seconds
 queueEntries();
-//schedule.scheduleJob('*/3 * * * * *', queueEntries);
+// schedule.scheduleJob('*/3 * * * * *', queueEntries);
