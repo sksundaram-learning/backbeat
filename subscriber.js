@@ -12,14 +12,14 @@ const log = logger.newRequestLogger();
 
 const sourceHostname = 'localhost';
 const sourcePort = '8000';
-const targetHostname = 'localhost';
-const targetPort = '8002';
+const targetHostname = '217.182.11.7';
+const targetPort = '8000';
 
 const sub = new Subscriber({
     zookeeper: { host: 'localhost', port: 2181 },
     log: { logLevel: 'info', dumpLevel: 'error' },
     topic: 'replication',
-    partition: 0,
+    partition: 1,
     groupId: 'crr',
 });
 const subClient = sub.setClient();
@@ -148,4 +148,4 @@ function replicateEntries() {
     });
 }
 // schedule every 15 seconds
-schedule.scheduleJob('*/15 * * * * *', replicateEntries);
+schedule.scheduleJob('*/5 * * * * *', replicateEntries);

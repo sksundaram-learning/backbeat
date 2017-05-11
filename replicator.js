@@ -20,7 +20,7 @@ const pub = new Publisher({
     zookeeper: { host: 'localhost', port: 2181 },
     log: { logLevel: 'info', dumpLevel: 'error' },
     topic: 'replication',
-    partition: 0,
+    partition: 1,
 });
 
 const LOGNAME = 'main';
@@ -36,8 +36,9 @@ function queueEntries() {
         pub.setClient(err => {
             if (err) {
                 return log.error('error in publisher.setClient',
-                                 { error: err });
+                                 { error: err.stack });
             }
+	    // pub.refreshMetadata();
             const readOptions = { minSeq: (lastProcessedSeq + 1) };
             logProxy.readRecords(readOptions, (err, recordStream) => {
                 recordStream.on('data', record => {
@@ -64,7 +65,7 @@ function queueEntries() {
                     }
                 });
                 recordStream.on('end', () => {
-                    pub.close();
+                    //pub.close();
                     log.info('ending record stream');
                 });
             });
@@ -75,4 +76,4 @@ function queueEntries() {
 }
 
 // schedule every 10 seconds
-schedule.scheduleJob('*/10 * * * * *', queueEntries);
+schedule.scheduleJob('*/3 * * * * *', queueEntries);
