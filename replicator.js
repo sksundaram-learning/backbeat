@@ -6,16 +6,6 @@ const MetadataFileClient = arsenal.storage.metadata.MetadataFileClient;
 const logger = new Logger('Backbeat:Replication');
 const log = logger.newRequestLogger();
 
-const sourceMD = new MetadataFileClient({
-    host: 'localhost',
-    port: '9990',
-    recordLogEnabled: true,
-    log: {
-        logLevel: 'info',
-        dumpLevel: 'error',
-    },
-});
-
 const pub = new Publisher({
     zookeeper: { host: 'localhost', port: 2181 },
     log: { logLevel: 'info', dumpLevel: 'error' },
@@ -29,6 +19,15 @@ let lastProcessedSeq = 0;
 
 
 function queueEntries() {
+    let sourceMD = new MetadataFileClient({
+        host: 'localhost',
+        port: '9990',
+        recordLogEnabled: true,
+        log: {
+            logLevel: 'info',
+            dumpLevel: 'error',
+        },
+    });
     sourceMD.openRecordLog(LOGNAME, (err, logProxy) => {
         if (err) {
             return log.error('error fetching log stream', { error: err });
@@ -65,8 +64,10 @@ function queueEntries() {
                     }
                 });
                 recordStream.on('end', () => {
-                    //pub.close();
+                    pub.close();
+                    sourceMD = null;
                     log.info('ending record stream');
+
                 });
             });
             return undefined;
