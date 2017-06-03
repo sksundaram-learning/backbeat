@@ -27,7 +27,7 @@ const replicationConfig = {
     //},
     file: bucketFileConfig,
     cronRule: '*/5 * * * * *',
-    batchMaxRead: 10,
+    batchMaxRead: 10000,
 };
 
 
