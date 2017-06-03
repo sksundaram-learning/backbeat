@@ -10,16 +10,16 @@ const log = logger.newRequestLogger();
 //FIXME: should be from config object
 const raftConfig = {
     repds: [
-        { host: 'localhost', adminPort: 4205 },
-        { host: 'localhost', adminPort: 4206 },
-        { host: 'localhost', adminPort: 4207 },
-        { host: 'localhost', adminPort: 4208 },
-        { host: 'localhost', adminPort: 4209 },
+        { host: '172.17.0.2', adminPort: 4205 },
+        { host: '172.17.0.2', adminPort: 4206 },
+        { host: '172.17.0.2', adminPort: 4207 },
+        { host: '172.17.0.2', adminPort: 4208 },
+        { host: '172.17.0.2', adminPort: 4209 },
     ],
 }
 
 const zookeeperConfig = { host: 'localhost', port: 2181 };
-const bucketFileConfig = { host: 'localhost', port: 9990 };
+const bucketFileConfig = { host: '172.17.0.2', port: 9990 };
 
 const replicationConfig = {
     //scality: {

@@ -5,7 +5,7 @@ const schedule = require('node-schedule');
 const mapSeries = async.mapSeries;
 const waterfall = async.waterfall;
 
-const Subscriber = require('./lib/Subscriber');
+const Subscriber = require('../../lib/Subscriber');
 const Logger = require('werelogs').Logger;
 const logger = new Logger('Backbeat:Replication');
 const log = logger.newRequestLogger();

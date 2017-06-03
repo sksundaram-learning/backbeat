@@ -32,7 +32,9 @@ function openBucketFileLog(bucketFileConfig, log, done) {
             dumpLevel: 'error',
         },
     });
-    const logProxy = mdClient.openRecordLog({}, err => {
+    const logProxy = mdClient.openRecordLog({
+        logName: bucketFileConfig.logName,
+    }, err => {
         if (err) {
             return done(err);
         }
@@ -109,7 +111,11 @@ function readLastProcessedSeq(replicatorState, log, done) {
 
 function createReplicator(logState, zookeeperConfig, log, cb) {
     const replicatorState = { logState };
-    const zkConf = zookeeperConfig || { host: 'localhost', port: 2181 };
+    const zkConf = { host: 'localhost', port: 2181,
+                     namespace: '/backbeat/replicator' };
+    if (zookeeperConfig) {
+        Object.assign(zkConf, zookeeperConfig);
+    }
     async.parallel([
         done => {
             const producer = new BackbeatProducer({
@@ -126,7 +132,7 @@ function createReplicator(logState, zookeeperConfig, log, cb) {
         },
         done => {
             const zookeeperUrl =
-                      `${zkConf.host}:${zkConf.port}/backbeat/replicator`;
+                      `${zkConf.host}:${zkConf.port}${zkConf.namespace}`;
             log.info('opening zookeeper connection for state management',
                      { zookeeperUrl });
             const zkClient = zookeeper.createClient(zookeeperUrl);

@@ -4,7 +4,7 @@
   "description": "Asynchronous queue and job manager",
   "main": "index.js",
   "scripts": {
-    "test": "mocha --recursive tests/",
+    "test": "mocha --recursive lib/**/*.spec.js extensions/**/*.spec.js",
     "lint": "eslint $(git ls-files '*.js')",
     "lint_md": "mdlint $(git ls-files '*.md')"
   },
