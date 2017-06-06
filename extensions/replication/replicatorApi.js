@@ -40,6 +40,7 @@ function openBucketFileLog(bucketFileConfig, log, done) {
         }
         const bucketFileLogState = {
             logProxy,
+            logName: bucketFileConfig.logName || 'main',
         };
         return done(null, bucketFileLogState);
     });
@@ -50,7 +51,9 @@ function writeLastProcessedSeq(replicatorState, log, done) {
     const pathToLastProcessedSeq = replicatorState.pathToLastProcessedSeq;
     const lastProcessedSeq = replicatorState.lastProcessedSeq;
     log.debug('saving last processed sequence number',
-              { method: 'writeLastProcessedSeq', lastProcessedSeq });
+              { method: 'writeLastProcessedSeq',
+                zkPath: pathToLastProcessedSeq,
+                lastProcessedSeq });
     zkClient.setData(
         pathToLastProcessedSeq, Buffer(lastProcessedSeq.toString()), -1,
         err => {
@@ -140,10 +143,10 @@ function createReplicator(logState, zookeeperConfig, log, cb) {
             replicatorState.zkClient = zkClient;
             if (logState.raftSession !== undefined) {
                 replicatorState.pathToLastProcessedSeq =
-                    `/logState/${logState.raftSession}/lastProcessedSeq`;
+                    `/logState/raft_${logState.raftSession}/lastProcessedSeq`;
             } else {
                 replicatorState.pathToLastProcessedSeq =
-                    '/logState/bucketFile/lastProcessedSeq';
+                    `/logState/bucketFile_${logState.logName}/lastProcessedSeq`;
             }
             readLastProcessedSeq(replicatorState, log, (err, seq) => {
                 if (err) {
@@ -168,8 +171,9 @@ function createReplicator(logState, zookeeperConfig, log, cb) {
 function logEntryToQueueEntry(record, entry, log) {
     if (entry.type === 'put') {
         const value = JSON.parse(entry.value);
-        const repStatus = value['x-amz-replication-status'];
-        if (! isMasterKey(entry.key) && repStatus === 'PENDING') {
+        if (! isMasterKey(entry.key) &&
+            value.replicationInfo &&
+            value.replicationInfo.status === 'PENDING') {
             log.trace('pushing entry', { entry });
             const queueEntry = {
                 type: entry.type,
