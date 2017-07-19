@@ -4,6 +4,7 @@ const async = require('async');
 const assert = require('assert');
 const AWS = require('aws-sdk');
 const http = require('http');
+const BackOff = require('backo');
 
 const Logger = require('werelogs').Logger;
 
@@ -226,7 +227,7 @@ class QueueProcessor {
             VersionId: entry.getEncodedVersionId() });
         const incomingMsg = req.createReadStream();
         req.on('error', err => {
-            log.error('error response getting data from S3',
+            log.error('an error occurred when getting data from S3',
                       { entry: entry.getLogInfo(),
                         origin: this.sourceConfig.s3,
                         error: err.message,
@@ -254,7 +255,7 @@ class QueueProcessor {
             Body: sourceStream,
         }, (err, data) => {
             if (err) {
-                log.error('error response from destination S3 server',
+                log.error('an error occurred when putting data to S3',
                           { entry: entry.getLogInfo(),
                             origin: this.destConfig.s3,
                             error: err.message,
@@ -265,7 +266,7 @@ class QueueProcessor {
         });
     }
 
-    _putMetaData(where, entry, log, cb) {
+    _putMetadata(where, entry, log, cb) {
         log.debug('putting metadata',
                   { where, entry: entry.getLogInfo(),
                     replicationStatus: entry.getReplicationStatus() });
@@ -280,7 +281,7 @@ class QueueProcessor {
             Body: mdBlob,
         }, (err, data) => {
             if (err) {
-                log.error('error response from S3',
+                log.error('an error occurred when putting metadata to S3',
                           { entry: entry.getLogInfo(),
                             origin: this.destConfig.s3,
                             error: err.message,
@@ -344,58 +345,41 @@ class QueueProcessor {
                       { error: sourceEntry.error });
             return process.nextTick(() => done(errors.InternalError));
         }
+        const backoffCtx = new BackOff({ min: 1000, max: 300000,
+                                         jitter: 0.1, factor: 1.5 });
+        return this._tryProcessQueueEntry(sourceEntry, backoffCtx, log,
+                                          done);
+    }
+
+    _tryProcessQueueEntry(sourceEntry, backoffCtx, log, done) {
         const destEntry = sourceEntry.toReplicaEntry();
 
         log.debug('processing entry',
                   { entry: sourceEntry.getLogInfo() });
 
-        const _doneProcessingCompletedEntry = err => {
-            if (err) {
-                log.error('an error occurred while writing ' +
-                          'replication status to COMPLETED',
+        const _handleReplicationOutcome = err => {
+            if (!err) {
+                log.debug('replication succeeded for object, updating ' +
+                          'source replication status to COMPLETED',
                           { entry: sourceEntry.getLogInfo() });
-                return done(err);
+                return this._tryUpdateReplicationStatus(
+                    sourceEntry.toCompletedEntry(), backoffCtx, log, done);
             }
-            log.info('entry replicated successfully',
-                     { entry: sourceEntry.getLogInfo() });
-            return done();
-        };
-
-        const _doneProcessingFailedEntry = err => {
-            if (err) {
-                log.error('an error occurred while writing ' +
-                          'replication status to FAILED',
-                          { entry: sourceEntry.getLogInfo() });
-                return done(err);
-            }
-            log.info('replication status set to FAILED',
-                     { entry: sourceEntry.getLogInfo() });
-            return done();
-        };
-
-        const _writeReplicationStatus = err => {
-            if (err) {
-                log.warn('replication failed for object',
+            // Rely on AWS SDK notion of retryable error to decide if
+            // we should set the entry replication status to FAILED
+            // (non retryable) or retry later.
+            if (err.retryable) {
+                log.warn('temporary failure to replicate object',
                          { entry: sourceEntry.getLogInfo(),
                            error: err });
-                if (this.backbeatSource !== null) {
-                    return this._putMetaData('source',
-                                             sourceEntry.toFailedEntry(),
-                                             log,
-                                             _doneProcessingFailedEntry);
-                }
-                log.info('replication status update skipped',
-                         { entry: sourceEntry.getLogInfo() });
-                return done();
-                // TODO: queue entry back in kafka for later retry
+                return this._retryProcessQueueEntry(sourceEntry, backoffCtx,
+                                                    log, done);
             }
-            log.debug('replication succeeded for object, updating ' +
-                      'source replication status to COMPLETED',
+            log.debug('replication failed permanently for object, ' +
+                      'updating replication status to FAILED',
                       { entry: sourceEntry.getLogInfo() });
-            return this._putMetaData('source',
-                                     sourceEntry.toCompletedEntry(),
-                                     log,
-                                     _doneProcessingCompletedEntry);
+            return this._tryUpdateReplicationStatus(
+                sourceEntry.toFailedEntry(), backoffCtx, log, done);
         };
 
         if (sourceEntry.isDeleteMarker()) {
@@ -410,9 +394,9 @@ class QueueProcessor {
                 // put metadata in target bucket
                 (accountAttr, next) => {
                     // TODO check that bucket role matches role in metadata
-                    this._putMetaData('target', destEntry, log, next);
+                    this._putMetadata('target', destEntry, log, next);
                 },
-            ], _writeReplicationStatus);
+            ], _handleReplicationOutcome);
         }
         return async.waterfall([
             // get data stream from source bucket
@@ -435,9 +419,63 @@ class QueueProcessor {
             // target bucket
             (location, next) => {
                 destEntry.setLocation(location);
-                this._putMetaData('target', destEntry, log, next);
+                this._putMetadata('target', destEntry, log, next);
             },
-        ], _writeReplicationStatus);
+        ], _handleReplicationOutcome);
+    }
+
+    _tryUpdateReplicationStatus(updatedSourceEntry, backoffCtx, log, done) {
+        const _doneUpdate = err => {
+            if (!err) {
+                log.info('replication status updated',
+                         { entry: updatedSourceEntry.getLogInfo(),
+                           replicationStatus:
+                           updatedSourceEntry.getReplicationStatus() });
+                return done();
+            }
+            log.error('an error occurred when writing replication ' +
+                      'status',
+                      { entry: updatedSourceEntry.getLogInfo(),
+                        replicationStatus:
+                        updatedSourceEntry.getReplicationStatus() });
+            // Rely on AWS SDK notion of retryable error to decide if
+            // we should retry or give up updating the status.
+            if (err.retryable) {
+                return this._retryUpdateReplicationStatus(
+                    updatedSourceEntry, backoffCtx, log, done);
+            }
+            return done();
+        };
+
+        if (this.backbeatSource !== null) {
+            return this._putMetadata('source',
+                                     updatedSourceEntry, log, _doneUpdate);
+        }
+        log.info('replication status update skipped',
+                 { entry: updatedSourceEntry.getLogInfo(),
+                   replicationStatus:
+                   updatedSourceEntry.getReplicationStatus() });
+        return done();
+    }
+
+    _retryProcessQueueEntry(sourceEntry, backoffCtx, log, done) {
+        const retryDelayMs = backoffCtx.duration();
+        log.info('scheduled retry of entry replication',
+                 { entry: sourceEntry.getLogInfo(),
+                   retryDelay: `${retryDelayMs}ms` });
+        setTimeout(this._tryProcessQueueEntry.bind(
+            this, sourceEntry, backoffCtx, log, done),
+                   retryDelayMs);
+    }
+
+    _retryUpdateReplicationStatus(updatedSourceEntry, backoffCtx, log, done) {
+        const retryDelayMs = backoffCtx.duration();
+        log.info('scheduled retry of replication status update',
+                 { entry: updatedSourceEntry.getLogInfo(),
+                   retryDelay: `${retryDelayMs}ms` });
+        setTimeout(this._tryUpdateReplicationStatus.bind(
+            this, updatedSourceEntry, backoffCtx, log, done),
+                   retryDelayMs);
     }
 
     start() {
