@@ -3,16 +3,14 @@ const zookeeper = require('node-zookeeper-client');
 
 const Logger = require('werelogs').Logger;
 
-const arsenal = require('arsenal');
 const errors = require('arsenal').errors;
-const BucketClient = require('bucketclient').RESTClient;
-const { isMasterKey } = require('arsenal/lib/versioning/Version');
-const MetadataFileClient = arsenal.storage.metadata.MetadataFileClient;
-const LogConsumer = arsenal.storage.metadata.LogConsumer;
 
 const BackbeatProducer = require('../../../lib/BackbeatProducer');
 const ProvisionDispatcher =
           require('../../../lib/provisioning/ProvisionDispatcher');
+const RaftLogReader = require('./RaftLogReader');
+const BucketFileLogReader = require('./BucketFileLogReader');
+
 
 class QueuePopulator {
     /**
@@ -51,6 +49,12 @@ class QueuePopulator {
                                  { level: logConfig.logLevel,
                                    dump: logConfig.dumpLevel });
         this.log = this.logger.newRequestLogger();
+
+        // list of active log readers
+        this.logReaders = [];
+
+        // list of updated log readers, if any
+        this.logReadersUpdate = null;
     }
 
     /**
@@ -60,9 +64,6 @@ class QueuePopulator {
      * @return {undefined}
      */
     open(cb) {
-        this.logState = null;
-        this.updatedLogState = undefined;
-
         return async.parallel([
             done => this._setupProducer(done),
             done => this._setupZookeeper(done),
@@ -73,7 +74,7 @@ class QueuePopulator {
                                  error: err, errorStack: err.stack });
                 return cb(err);
             }
-            this._setupLogSource();
+            this._setupLogSources();
             return cb();
         });
     }
@@ -90,16 +91,23 @@ class QueuePopulator {
         ], cb);
     }
 
-    _setupLogSource() {
+    _setupLogSources() {
         switch (this.sourceConfig.logSource) {
         case 'bucketd':
             // initialization of log source is deferred until the
-            // dispatcher notifies us of which raft session we're
+            // dispatcher notifies us of which raft sessions we're
             // responsible for
             this._subscribeToRaftSessionDispatcher();
             break;
         case 'dmd':
-            this._openBucketFileLog();
+            this.logReadersUpdate = [
+                new BucketFileLogReader({ zkClient: this.zkClient,
+                                          kafkaProducer: this.producer,
+                                          dmdConfig: this.sourceConfig.dmd,
+                                          logConfig: this.logConfig,
+                                          log: this.log,
+                                        }),
+            ];
             break;
         default:
             throw new Error("bad 'logSource' config value: expect 'bucketd'" +
@@ -124,68 +132,19 @@ class QueuePopulator {
             if (items.length === 0) {
                 this.log.info('no raft ID provisioned, idling',
                               { zkEndpoint });
-                this.updatedLogState = null;
-                return undefined;
             }
-            if (items.length > 1) {
-                this.log.warn('more than one raft ID provisioned, idling',
-                              { zkEndpoint, provisionList: items });
-                this.updatedLogState = null;
-                return undefined;
-            }
-            return this._openRaftLog(items[0]);
+            this.logReadersUpdate = items.map(
+                raftId => new RaftLogReader({
+                    zkClient: this.zkClient,
+                    kafkaProducer: this.producer,
+                    bucketdConfig: this.sourceConfig.bucketd,
+                    raftId,
+                    log: this.log,
+                }));
+            return undefined;
         });
         this.log.info('waiting to be provisioned a raft ID',
                       { zkEndpoint });
-    }
-
-    _openRaftLog(raftId) {
-        const bucketdConfig = this.sourceConfig.bucketd;
-        this.log.info('initializing raft log handle',
-                      { method: 'QueuePopulator._openRaftLog',
-                        bucketdConfig, raftId });
-        const { host, port } = bucketdConfig;
-        const bucketClient = new BucketClient(`${host}:${port}`);
-        const logState = {
-            raftSession: raftId,
-            pathToLogOffset: `/logState/raft_${raftId}/logOffset`,
-            logConsumer: new LogConsumer({ bucketClient,
-                                           raftSession: raftId,
-                                           logger: this.log }),
-            logOffset: null,
-        };
-        this._loadLogState(logState);
-    }
-
-    _openBucketFileLog() {
-        const dmdConfig = this.sourceConfig.dmd;
-        this.log.info('initializing bucketfile log handle',
-                      { method: 'QueuePopulator._openBucketFileLog',
-                        dmdConfig });
-
-        const mdClient = new MetadataFileClient({
-            host: dmdConfig.host,
-            port: dmdConfig.port,
-            log: this.logConfig,
-        });
-        const logConsumer = mdClient.openRecordLog({
-            logName: dmdConfig.logName,
-        }, err => {
-            if (err) {
-                this.log.error('error opening record log',
-                               { method: 'QueuePopulator._openBucketFileLog',
-                                 dmdConfig });
-                return undefined;
-            }
-            const logState = {
-                logName: dmdConfig.logName,
-                pathToLogOffset:
-                `/logState/bucketFile_${dmdConfig.logName}/logOffset`,
-                logConsumer,
-                logOffset: null,
-            };
-            return this._loadLogState(logState);
-        });
     }
 
     _setupProducer(done) {
@@ -212,97 +171,22 @@ class QueuePopulator {
         this.log.info('opening zookeeper connection for persisting ' +
                       'populator state',
                       { zookeeperUrl });
-        const zkClient = zookeeper.createClient(zookeeperUrl);
-        zkClient.connect();
-        this.zkClient = zkClient;
-        done();
+        this.zkClient = zookeeper.createClient(zookeeperUrl);
+        this.zkClient.connect();
+        this.zkClient.on('connected', done);
     }
 
-    _loadLogState(logState) {
-        this._readLogOffset(logState, (err, offset) => {
-            if (err) {
-                // already logged in _readLogState
-                return undefined;
-            }
-            // eslint-disable-next-line no-param-reassign
-            logState.logOffset = offset;
-            this.log.info('queue populator is ready to populate ' +
-                          'replication queue',
-                          { raftId: logState.raftSession,
-                            logName: logState.logName,
-                            logOffset: logState.logOffset });
-            // queue log state for next processing batch
-            this.updatedLogState = logState;
-            return undefined;
-        });
-    }
-
-    _writeLogOffset(done) {
-        const zkClient = this.zkClient;
-        const pathToLogOffset = this.logState.pathToLogOffset;
-        zkClient.setData(
-            pathToLogOffset, new Buffer(this.logState.logOffset.toString()), -1,
-            err => {
-                if (err) {
-                    this.log.error(
-                        'error saving log offset',
-                        { method: 'QueuePopulator._writeLogOffset',
-                          zkPath: pathToLogOffset,
-                          logOffset: this.logState.logOffset });
-                    return done(err);
-                }
-                this.log.debug(
-                    'saved log offset',
-                    { method: 'QueuePopulator._writeLogOffset',
-                      zkPath: pathToLogOffset,
-                      logOffset: this.logState.logOffset });
-                return done();
-            });
-    }
-
-    _readLogOffset(logState, done) {
-        const zkClient = this.zkClient;
-        const pathToLogOffset = logState.pathToLogOffset;
-        this.zkClient.getData(pathToLogOffset, (err, data) => {
-            if (err) {
-                if (err.name !== 'NO_NODE') {
-                    this.log.error(
-                        'Could not fetch log offset',
-                        { method: 'QueuePopulator._readLogOffset',
-                          error: err, errorStack: err.stack });
-                    return done(err);
-                }
-                return zkClient.mkdirp(pathToLogOffset, err => {
-                    if (err) {
-                        this.log.error(
-                            'Could not pre-create path in zookeeper',
-                            { method: 'QueuePopulator._readLogOffset',
-                              zkPath: pathToLogOffset,
-                              error: err, errorStack: err.stack });
-                        return done(err);
-                    }
-                    return done(null, 1);
-                });
-            }
-            if (data) {
-                const logOffset = Number.parseInt(data, 10);
-                if (isNaN(logOffset)) {
-                    this.log.error(
-                        'invalid stored log offset',
-                        { method: 'QueuePopulator._readLogOffset',
-                          zkPath: pathToLogOffset,
-                          logOffset: data.toString() });
-                    return done(null, 1);
-                }
-                this.log.debug(
-                    'fetched current log offset successfully',
-                    { method: 'QueuePopulator._readLogOffset',
-                      zkPath: pathToLogOffset,
-                      logOffset });
-                return done(null, logOffset);
-            }
-            return done(null, 1);
-        });
+    _setupUpdatedReaders(done) {
+        const newReaders = this.logReadersUpdate;
+        this.logReadersUpdate = null;
+        async.each(newReaders, (logReader, cb) => logReader.setup(cb),
+                   err => {
+                       if (err) {
+                           return done(err);
+                       }
+                       this.logReaders = newReaders;
+                       return done();
+                   });
     }
 
     _closeLogState(done) {
@@ -316,228 +200,37 @@ class QueuePopulator {
         this.producer.close(done);
     }
 
-    _logEntryToQueueEntry(record, entry) {
-        if (entry.type === 'put' &&
-            entry.key !== undefined && entry.value !== undefined &&
-            ! isMasterKey(entry.key)) {
-            const value = JSON.parse(entry.value);
-            if (value.replicationInfo &&
-                value.replicationInfo.status === 'PENDING') {
-                this.log.trace('queueing entry', { entry });
-                const queueEntry = {
-                    type: entry.type,
-                    bucket: record.db,
-                    key: entry.key,
-                    value: entry.value,
-                };
-                return {
-                    key: entry.key,
-                    message: JSON.stringify(queueEntry),
-                };
-            }
-        }
-        return null;
-    }
-
-    /* eslint-disable no-param-reassign */
-
-    /**
-     * Process log entries, up to the maximum defined in params
-     *
-     * @param {Object} [params] - parameters object
-     * @param {Number} [params.maxRead] - max number of records to process
-     *   from the log. Records may contain multiple entries and all entries
-     *   are not queued, so the number of queued entries is not directly
-     *   related to this number.
-     * @param {function} done - callback when done processing the
-     *   entries. Called with an error, or null and a statistics object as
-     *   second argument. On success, the statistics contain the following:
-     *     - readRecords {Number} - number of records read
-     *     - readEntries {Number} - number of entries read (records can
-     *       hold multiple entries)
-     *     - queuedEntries {Number} - number of new entries queued in kafka
-     *       topic
-     *     - logOffset {Number} - next offset (sequence number) to process
-     *       from the log
-     *     - processedAll {Boolean} - true if the log has no more unread
-     *       records
-     * @return {undefined}
-     */
-    processLogEntries(params, done) {
-        if (this.updatedLogState !== undefined) {
-            this.logState = this.updatedLogState;
-            this.updatedLogState = undefined;
-        }
-        if (this.logState === null) {
+    _processAllLogEntries(params, done) {
+        if (this.logReaders.length === 0) {
             this.log.debug('queue populator has no configured log source');
             return process.nextTick(() => done(errors.ServiceUnavailable));
         }
-        return this._processLogEntries(params, done);
-    }
-
-    _processLogEntries(params, done) {
-        const batchState = {
-            logRes: null,
-            logStats: {
-                nbLogRecordsRead: 0,
-                nbLogEntriesRead: 0,
-            },
-            entriesToPublish: [],
-        };
-        async.waterfall([
-            next => this._processReadRecords(params, batchState, next),
-            next => this._processPrepareEntries(batchState, next),
-            next => this._processPublishEntries(batchState, next),
-            next => this._processSaveLogOffset(batchState, next),
-        ],
-            err => {
+        return async.map(
+            this.logReaders,
+            (logReader, done) => logReader.processAllLogEntries(params, done),
+            (err, results) => {
                 if (err) {
                     return done(err);
                 }
-                const processedAll = !params
-                          || !params.maxRead
-                          || (batchState.logStats.nbLogRecordsRead
-                              < params.maxRead);
-                return done(null, {
-                    raftId: this.logState.raftSession,
-                    readRecords: batchState.logStats.nbLogRecordsRead,
-                    readEntries: batchState.logStats.nbLogEntriesRead,
-                    queuedEntries: batchState.entriesToPublish.length,
-                    logOffset: this.logState.logOffset,
-                    processedAll,
-                });
+                const annotatedResults = results.map(
+                    (result, i) => Object.assign(result, {
+                        logSource: this.logReaders[i].getLogInfo(),
+                        logOffset: this.logReaders[i].getLogOffset(),
+                    }));
+                return done(null, annotatedResults);
             });
-        return undefined;
     }
-
-    _processReadRecords(params, batchState, done) {
-        const readOptions = {};
-        if (this.logState.logOffset !== undefined) {
-            readOptions.startSeq = this.logState.logOffset;
-        }
-        if (params && params.maxRead !== undefined) {
-            readOptions.limit = params.maxRead;
-        }
-        this.log.debug('reading records', { readOptions });
-        this.logState.logConsumer.readRecords(readOptions, (err, res) => {
-            if (err) {
-                this.log.error(
-                    'error while reading log records',
-                    { method: 'QueuePopulator._processReadRecords',
-                      params, error: err, errorStack: err.stack });
-                return done(err);
-            }
-            this.log.debug(
-                'readRecords callback',
-                { method: 'QueuePopulator._processReadRecords',
-                  params, info: res.info });
-            batchState.logRes = res;
-            return done();
-        });
-    }
-
-    _processPrepareEntries(batchState, done) {
-        const { logRes, logStats } = batchState;
-
-        if (logRes.info.start === null) {
-            return done(null);
-        }
-        logRes.log.on('data', record => {
-            logStats.nbLogRecordsRead += 1;
-            record.entries.forEach(entry => {
-                logStats.nbLogEntriesRead += 1;
-                const queueEntry = this._logEntryToQueueEntry(record, entry);
-                if (queueEntry) {
-                    batchState.entriesToPublish.push(queueEntry);
-                }
-            });
-        });
-        logRes.log.on('error', err => {
-            this.log.error('error fetching entries from log',
-                           { method: 'QueuePopulator._processPrepareEntries',
-                             error: err });
-            return done(err);
-        });
-        logRes.log.on('end', () => {
-            this.log.debug('ending record stream');
-            return done();
-        });
-        return undefined;
-    }
-
-    _processPublishEntries(batchState, done) {
-        const { entriesToPublish, logRes, logStats } = batchState;
-
-        if (entriesToPublish.length === 0) {
-            if (logRes.info.start !== null) {
-                batchState.nextLogOffset =
-                    logRes.info.start + logStats.nbLogRecordsRead;
-            }
-            return done();
-        }
-        return this.producer.send(entriesToPublish, err => {
-            if (err) {
-                this.log.error(
-                    'error publishing entries from log',
-                    { method: 'QueuePopulator._processPublishEntries',
-                      error: err, errorStack: err.stack });
-                return done(err);
-            }
-            batchState.nextLogOffset =
-                logRes.info.start + logStats.nbLogRecordsRead;
-            this.log.debug(
-                'entries published successfully',
-                { method: 'QueuePopulator._processPublishEntries',
-                  entryCount: entriesToPublish.length,
-                  logOffset: batchState.nextLogOffset });
-            return done();
-        });
-    }
-
-    _processSaveLogOffset(batchState, done) {
-        if (batchState.nextLogOffset !== undefined &&
-            batchState.nextLogOffset !== this.logState.logOffset) {
-            this.logState.logOffset = batchState.nextLogOffset;
-            return this._writeLogOffset(done);
-        }
-        return process.nextTick(() => done());
-    }
-
-    /* eslint-enable no-param-reassign */
 
     processAllLogEntries(params, done) {
-        if (this.updatedLogState !== undefined) {
-            this.logState = this.updatedLogState;
-            this.updatedLogState = undefined;
+        if (this.logReadersUpdate !== null) {
+            return this._setupUpdatedReaders(err => {
+                if (err) {
+                    return done(err);
+                }
+                return this._processAllLogEntries(params, done);
+            });
         }
-        if (this.logState === null) {
-            this.log.debug('queue populator has no configured log source');
-            return process.nextTick(() => done(errors.ServiceUnavailable));
-        }
-        const self = this;
-        const countersTotal = {
-            raftId: this.logState.raftSession,
-            readRecords: 0,
-            readEntries: 0,
-            queuedEntries: 0,
-            logOffset: this.logState.logOffset,
-        };
-        function cbProcess(err, counters) {
-            if (err) {
-                return done(err);
-            }
-            countersTotal.readRecords += counters.readRecords;
-            countersTotal.readEntries += counters.readEntries;
-            countersTotal.queuedEntries += counters.queuedEntries;
-            countersTotal.logOffset = counters.logOffset;
-            self.log.debug('process batch finished',
-                           { counters, countersTotal });
-            if (counters.processedAll) {
-                return done(null, countersTotal);
-            }
-            return self._processLogEntries(params, cbProcess);
-        }
-        return this._processLogEntries(params, cbProcess);
+        return this._processAllLogEntries(params, done);
     }
 }
 

@@ -25,17 +25,20 @@ function queueBatch(queuePopulator, taskState) {
     taskState.batchInProgress = true;
     queuePopulator.processAllLogEntries(
         { maxRead: repConfig.queuePopulator.batchMaxRead },
-        (err, counters) => {
+        (err, countersPerReader) => {
             if (err) {
                 if (!err.ServiceUnavailable) {
                     log.error('an error occurred during replication',
                               { error: err, errorStack: err.stack });
                 }
             } else {
-                const logFunc = (counters.readRecords > 0 ?
-                                 log.info : log.debug)
+                const logFunc =
+                          (countersPerReader.some(
+                              counters => counters.readRecords > 0) ?
+                           log.info : log.debug)
                           .bind(log);
-                logFunc('replication batch finished', { counters });
+                logFunc('replication batch finished',
+                        { counters: countersPerReader });
             }
             taskState.batchInProgress = false;
         });
