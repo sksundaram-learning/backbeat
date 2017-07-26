@@ -43,22 +43,21 @@ class _AccountAuthManager {
         this.accountArn = accountInfo.arn;
         this.canonicalID = accountInfo.canonicalID;
         this.displayName = accountInfo.displayName;
-        this.credentialProvider = new AWS.CredentialProviderChain([
-            new AWS.Credentials(accountInfo.keys.access,
-                                accountInfo.keys.secret),
-        ]);
+        this.credentials = new AWS.Credentials(accountInfo.keys.access,
+                                               accountInfo.keys.secret);
     }
 
-    getCredentialProvider() {
-        return this.credentialProvider;
+    getCredentials() {
+        return this.credentials;
     }
 
     lookupAccountAttributes(accountId, cb) {
-        if (!this.accountArn.startsWith(accountId)) {
+        const localAccountId = this.accountArn.split(':')[3];
+        if (localAccountId !== accountId) {
             this.log.error('Target account for replication must match ' +
                            'configured destination account ARN',
-                           { targetAccount: accountId,
-                             localAccountArn: this.accountArn });
+                           { targetAccountId: accountId,
+                             localAccountId });
             return process.nextTick(() => cb(errors.AccountNotFound));
         }
         // return local account's attributes
@@ -73,12 +72,12 @@ class _RoleAuthManager {
         this._log = log;
         const { host, port } = authConfig.vault;
         this._vaultclient = new VaultClient(host, port);
-        this.credentialProvider = new CredentialsManager(host, port,
-            'replication', roleArn);
+        this.credentials = new CredentialsManager(host, port,
+                                                  'replication', roleArn);
     }
 
-    getCredentialProvider() {
-        return this.credentialProvider;
+    getCredentials() {
+        return this.credentials;
     }
 
     lookupAccountAttributes(accountId, cb) {
@@ -176,11 +175,12 @@ class QueueProcessor {
         return this.S3source.getBucketReplication(
             { Bucket: entry.getBucket() }, (err, data) => {
                 if (err) {
-                    this.log.error('error response getting replication ' +
+                    this.log.error('error getting replication ' +
                                    'configuration from S3',
                                    { entry: entry.getLogInfo(),
                                      origin: this.sourceConfig.s3,
-                                     error: err,
+                                     error: { message: err.message },
+                                     errorStack: err.stack,
                                      httpStatus: err.statusCode });
                     return cb(err);
                 }
@@ -226,7 +226,8 @@ class QueueProcessor {
             this.log.error('an error occurred when getting data from S3',
                            { entry: entry.getLogInfo(),
                              origin: this.sourceConfig.s3,
-                             error: err, httpStatus: err.statusCode });
+                             error: { message: err.message },
+                             httpStatus: err.statusCode });
             incomingMsg.emit('error', err);
         });
         return cb(null, incomingMsg);
@@ -237,7 +238,8 @@ class QueueProcessor {
         const cbOnce = jsutil.once(cb);
         sourceStream.on('error', err => {
             this.log.error('error from source S3 server',
-                           { entry: entry.getLogInfo(), error: err });
+                           { entry: entry.getLogInfo(),
+                             error: { message: err.message } });
             return cbOnce(err);
         });
         this.backbeatDest.putData({
@@ -252,7 +254,8 @@ class QueueProcessor {
                 this.log.error('an error occurred when putting data to S3',
                                { entry: entry.getLogInfo(),
                                  origin: this.destConfig.s3,
-                                 error: err });
+                                 error: { message: err.message },
+                                 errorStack: err.stack });
                 return cbOnce(err);
             }
             return cbOnce(null, data.Location);
@@ -277,7 +280,8 @@ class QueueProcessor {
                 this.log.error('an error occurred when putting metadata to S3',
                                { entry: entry.getLogInfo(),
                                  origin: this.destConfig.s3,
-                                 error: err });
+                                 error: { message: err.message },
+                                 errorStack: err.stack });
                 return cbOnce(err);
             }
             return cbOnce(null, data);
@@ -293,7 +297,7 @@ class QueueProcessor {
             endpoint: `${this.sourceConfig.s3.transport}://` +
                 `${this.sourceConfig.s3.host}:${this.sourceConfig.s3.port}`,
             credentials:
-            this.s3sourceAuthManager.getCredentialProvider(),
+            this.s3sourceAuthManager.getCredentials(),
             sslEnabled: true,
             s3ForcePathStyle: true,
             signatureVersion: 'v4',
@@ -302,7 +306,7 @@ class QueueProcessor {
             endpoint: `${this.sourceConfig.s3.transport}://` +
                 `${this.sourceConfig.s3.host}:${this.sourceConfig.s3.port}`,
             credentials:
-            this.s3sourceAuthManager.getCredentialProvider(),
+            this.s3sourceAuthManager.getCredentials(),
             sslEnabled: true,
         });
 
@@ -310,26 +314,26 @@ class QueueProcessor {
             endpoint: `${this.destConfig.s3.transport}://` +
                 `${this.destConfig.s3.host}:${this.destConfig.s3.port}`,
             credentials:
-            this.s3destAuthManager.getCredentialProvider(),
+            this.s3destAuthManager.getCredentials(),
             sslEnabled: true,
         });
     }
 
     _processKafkaEntry(kafkaEntry, done) {
         const sourceEntry = QueueEntry.createFromKafkaEntry(kafkaEntry);
-        const backoffCtx = new BackOff({ min: 1000, max: 300000,
-                                         jitter: 0.1, factor: 1.5 });
-        this._tryProcessQueueEntry(sourceEntry, backoffCtx, done);
-    }
-
-    _tryProcessQueueEntry(sourceEntry, backoffCtx, done) {
-        const destEntry = sourceEntry.toReplicaEntry();
-
         if (sourceEntry.error) {
             this.log.error('error processing source entry',
                            { error: sourceEntry.error });
             return process.nextTick(() => done(errors.InternalError));
         }
+        const backoffCtx = new BackOff({ min: 1000, max: 300000,
+                                         jitter: 0.1, factor: 1.5 });
+        return this._tryProcessQueueEntry(sourceEntry, backoffCtx, done);
+    }
+
+    _tryProcessQueueEntry(sourceEntry, backoffCtx, done) {
+        const destEntry = sourceEntry.toReplicaEntry();
+
         this.log.debug('processing entry',
                        { entry: sourceEntry.getLogInfo() });
 
