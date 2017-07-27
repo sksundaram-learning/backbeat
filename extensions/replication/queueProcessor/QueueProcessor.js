@@ -140,7 +140,7 @@ class QueueProcessor {
         this.logger = new Logger('Backbeat:Replication:QueueProcessor',
                                  { level: logConfig.logLevel,
                                    dump: logConfig.dumpLevel });
-        this.log = this.logger.newRequestLogger();
+        this.log = this.logger;
 
         this.s3sourceAuthManager = null;
         this.s3destAuthManager = null;
