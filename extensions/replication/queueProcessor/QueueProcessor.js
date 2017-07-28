@@ -160,7 +160,7 @@ class QueueProcessor {
         return new _RoleAuthManager(authConfig, roleArn, log);
     }
 
-    _getBucketReplicationRoles(entry, log, cb) {
+    _setupRoles(entry, log, cb) {
         log.debug('getting bucket replication',
                   { entry: entry.getLogInfo() });
         const entryRolesString = entry.getReplicationRoles();
@@ -170,10 +170,11 @@ class QueueProcessor {
         }
         if (entryRoles === undefined || entryRoles.length !== 2) {
             log.error('expecting two roles separated by a ' +
-                      'comma in replication configuration',
+                      'comma in entry replication configuration',
                       { entry: entry.getLogInfo(),
-                        origin: this.sourceConfig.s3 });
-            return cb(errors.InternalError);
+                        origin: this.sourceConfig.s3,
+                        roles: entryRolesString });
+            return cb(errors.BadRole);
         }
         this._setupClients(entryRoles[0], entryRoles[1], log);
         return this.S3source.getBucketReplication(
@@ -191,19 +192,39 @@ class QueueProcessor {
                 const roles = data.ReplicationConfiguration.Role.split(',');
                 if (roles.length !== 2) {
                     log.error('expecting two roles separated by a ' +
-                              'comma in replication configuration',
+                              'comma in bucket replication configuration',
                               { entry: entry.getLogInfo(),
-                                origin: this.sourceConfig.s3 });
-                    return cb(errors.InternalError);
+                                origin: this.sourceConfig.s3,
+                                roles });
+                    return cb(errors.BadRole);
+                }
+                if (roles[0] !== entryRoles[0]) {
+                    log.error('role in replication entry for source does ' +
+                              'not match role in bucket replication ' +
+                              'configuration ',
+                              { entry: entry.getLogInfo(),
+                                origin: this.sourceConfig.s3,
+                                entryRole: entryRoles[0],
+                                bucketRole: roles[0] });
+                    return cb(errors.BadRole);
+                }
+                if (roles[1] !== entryRoles[1]) {
+                    log.error('role in replication entry for target does ' +
+                              'not match role in bucket replication ' +
+                              'configuration ',
+                              { entry: entry.getLogInfo(),
+                                origin: this.sourceConfig.s3,
+                                entryRole: entryRoles[1],
+                                bucketRole: roles[1] });
+                    return cb(errors.BadRole);
                 }
                 return cb(null, roles[0], roles[1]);
             });
     }
 
-    _processRoles(sourceEntry, sourceRole, destEntry, targetRole, log, cb) {
-        log.debug('processing role for destination',
-                  { entry: destEntry.getLogInfo(),
-                    role: targetRole });
+    _setTargetAccountMd(destEntry, targetRole, log, cb) {
+        log.debug('changing target account owner',
+                  { entry: destEntry.getLogInfo() });
         const targetAccountId = _extractAccountIdFromRole(targetRole);
         this.s3destAuthManager.lookupAccountAttributes(
             targetAccountId, (err, accountAttr) => {
@@ -215,7 +236,7 @@ class QueueProcessor {
                             accountAttr });
                 destEntry.setOwner(accountAttr.canonicalID,
                                    accountAttr.displayName);
-                return cb(null, accountAttr);
+                return cb();
             });
     }
 
@@ -356,6 +377,7 @@ class QueueProcessor {
 
         log.debug('processing entry',
                   { entry: sourceEntry.getLogInfo() });
+        let step = null;
 
         const _handleReplicationOutcome = err => {
             if (!err) {
@@ -375,6 +397,18 @@ class QueueProcessor {
                 return this._retryProcessQueueEntry(sourceEntry, backoffCtx,
                                                     log, done);
             }
+            if ((step === 'setupRoles' ||
+                 step === 'setTargetAccountMd' ||
+                 step === 'getData') &&
+                (err.BadRole ||
+                 err.NoSuchEntity ||
+                 err.AccessDenied)) {
+                log.error('replication failed permanently for object, ' +
+                          'processing skipped',
+                          { entry: sourceEntry.getLogInfo(),
+                            error: err.description });
+                return done();
+            }
             log.debug('replication failed permanently for object, ' +
                       'updating replication status to FAILED',
                       { entry: sourceEntry.getLogInfo() });
@@ -385,14 +419,17 @@ class QueueProcessor {
         if (sourceEntry.isDeleteMarker()) {
             return async.waterfall([
                 next => {
-                    this._getBucketReplicationRoles(sourceEntry, log, next);
+                    step = 'setupRoles';
+                    this._setupRoles(sourceEntry, log, next);
                 },
                 (sourceRole, targetRole, next) => {
-                    this._processRoles(sourceEntry, sourceRole,
-                                       destEntry, targetRole, log, next);
+                    step = 'setTargetAccountMd';
+                    this._setTargetAccountMd(destEntry, targetRole, log,
+                                             next);
                 },
                 // put metadata in target bucket
-                (accountAttr, next) => {
+                next => {
+                    step = 'putMetadata';
                     // TODO check that bucket role matches role in metadata
                     this._putMetadata('target', destEntry, log, next);
                 },
@@ -401,23 +438,27 @@ class QueueProcessor {
         return async.waterfall([
             // get data stream from source bucket
             next => {
-                this._getBucketReplicationRoles(sourceEntry, log, next);
+                step = 'setupRoles';
+                this._setupRoles(sourceEntry, log, next);
             },
             (sourceRole, targetRole, next) => {
-                this._processRoles(sourceEntry, sourceRole,
-                                   destEntry, targetRole, log, next);
+                step = 'setTargetAccountMd';
+                this._setTargetAccountMd(destEntry, targetRole, log, next);
             },
-            (accountAttr, next) => {
+            next => {
+                step = 'getData';
                 // TODO check that bucket role matches role in metadata
                 this._getData(sourceEntry, log, next);
             },
             // put data in target bucket
             (stream, next) => {
+                step = 'putData';
                 this._putData(destEntry, stream, log, next);
             },
             // update location, replication status and put metadata in
             // target bucket
             (location, next) => {
+                step = 'putMetadata';
                 destEntry.setLocation(location);
                 this._putMetadata('target', destEntry, log, next);
             },
