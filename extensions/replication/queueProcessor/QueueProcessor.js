@@ -392,7 +392,7 @@ class QueueProcessor {
             // (non retryable) or retry later.
             if (err.retryable) {
                 log.warn('temporary failure to replicate object',
-                         { entry: sourceEntry.getLogInfo(),
+                         { step, entry: sourceEntry.getLogInfo(),
                            error: err });
                 return this._retryProcessQueueEntry(sourceEntry, backoffCtx,
                                                     log, done);
@@ -405,13 +405,13 @@ class QueueProcessor {
                  err.AccessDenied)) {
                 log.error('replication failed permanently for object, ' +
                           'processing skipped',
-                          { entry: sourceEntry.getLogInfo(),
+                          { step, entry: sourceEntry.getLogInfo(),
                             error: err.description });
                 return done();
             }
             log.debug('replication failed permanently for object, ' +
                       'updating replication status to FAILED',
-                      { entry: sourceEntry.getLogInfo() });
+                      { step, entry: sourceEntry.getLogInfo() });
             return this._tryUpdateReplicationStatus(
                 sourceEntry.toFailedEntry(), backoffCtx, log, done);
         };
