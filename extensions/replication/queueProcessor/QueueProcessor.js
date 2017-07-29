@@ -397,12 +397,13 @@ class QueueProcessor {
                 return this._retryProcessQueueEntry(sourceEntry, backoffCtx,
                                                     log, done);
             }
+
             if ((step === 'setupRoles' ||
                  step === 'setTargetAccountMd' ||
                  step === 'getData') &&
                 (err.BadRole ||
-                 err.NoSuchEntity ||
-                 err.AccessDenied)) {
+                 err.NoSuchEntity || err.statusCode === 404 ||
+                 err.AccessDenied || err.statusCode === 403)) {
                 log.error('replication failed permanently for object, ' +
                           'processing skipped',
                           { step, entry: sourceEntry.getLogInfo(),
