@@ -46,14 +46,13 @@ class LogReader {
         this.log.debug('setting up log source',
                        { method: 'LogReader.setup',
                          logSource: this.getLogInfo() });
-        this._readLogOffset((err, offset) => {
+        this._readLogOffset(err => {
             if (err) {
                 this.log.error('log source setup failed',
                                { method: 'LogReader.setup',
                                  logSource: this.getLogInfo() });
                 return done(err);
             }
-            this.logOffset = offset;
             this.log.info('log reader is ready to populate replication ' +
                           'queue',
                           { logSource: this.getLogInfo(),
@@ -70,6 +69,14 @@ class LogReader {
      */
     getLogOffset() {
         return this.logOffset;
+    }
+
+    _updateLogOffset(newLogOffset, done) {
+        if (newLogOffset !== this.logOffset) {
+            this.logOffset = newLogOffset;
+            return this._writeLogOffset(done);
+        }
+        return process.nextTick(() => done());
     }
 
     _readLogOffset(done) {
@@ -92,7 +99,8 @@ class LogReader {
                               error: err, errorStack: err.stack });
                         return done(err);
                     }
-                    return done(null, 1);
+                    this.logOffset = 1;
+                    return done();
                 });
             }
             if (data) {
@@ -103,16 +111,19 @@ class LogReader {
                         { method: 'LogReader._readLogOffset',
                           zkPath: pathToLogOffset,
                           logOffset: data.toString() });
-                    return done(null, 1);
+                    this.logOffset = 1;
+                    return done();
                 }
                 this.log.debug(
                     'fetched current log offset successfully',
                     { method: 'LogReader._readLogOffset',
                       zkPath: pathToLogOffset,
                       logOffset });
-                return done(null, logOffset);
+                this.logOffset = logOffset;
+                return done();
             }
-            return done(null, 1);
+            this.logOffset = 1;
+            return done();
         });
     }
 
@@ -326,10 +337,8 @@ class LogReader {
     }
 
     _processSaveLogOffset(batchState, done) {
-        if (batchState.nextLogOffset !== undefined &&
-            batchState.nextLogOffset !== this.logOffset) {
-            this.logOffset = batchState.nextLogOffset;
-            return this._writeLogOffset(done);
+        if (batchState.nextLogOffset !== undefined) {
+            return this._updateLogOffset(batchState.nextLogOffset, done);
         }
         return process.nextTick(() => done());
     }
