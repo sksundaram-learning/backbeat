@@ -107,33 +107,6 @@ function _extractAccountIdFromRole(role) {
     return role.split(':')[4];
 }
 
-function _retry(actionDesc, entry, func, log, done) {
-    const backoffCtx = new BackOff(BACKOFF_PARAMS);
-    let nbRetries = 0;
-
-    function _handleRes(...args) {
-        const err = args[0];
-        // Rely on AWS SDK notion of retryable error to decide if we
-        // should set the entry replication status to FAILED (non
-        // retryable) or retry later.
-        if (err && err.retryable) {
-            const retryDelayMs = backoffCtx.duration();
-            log.info(`temporary failure to ${actionDesc}, scheduled retry`,
-                     { entry: entry.getLogInfo(),
-                       nbRetries,
-                       retryDelay: `${retryDelayMs}ms` });
-            nbRetries += 1;
-            return setTimeout(() => func(_handleRes), retryDelayMs);
-        }
-        if (nbRetries > 0) {
-            log.info(`succeeded to ${actionDesc}`,
-                     { entry: entry.getLogInfo(), nbRetries });
-        }
-        return done.apply(null, args);
-    }
-    func(_handleRes);
-}
-
 class QueueProcessor {
 
     /**
@@ -157,6 +130,9 @@ class QueueProcessor {
      *   specific to queue processor
      * @param {String} repConfig.queueProcessor.groupId - kafka
      *   consumer group ID
+     * @param {String} repConfig.queueProcessor.retryTimeoutS -
+     *   number of seconds before giving up retries of an entry
+     *   replication
      * @param {Logger} logConfig - logging configuration object
      * @param {String} logConfig.logLevel - logging level
      * @param {Logger} logConfig.dumpLevel - dump level
@@ -190,27 +166,89 @@ class QueueProcessor {
         return new _RoleAuthManager(authConfig, roleArn, log);
     }
 
+    _retry(actionDesc, entry, shouldRetryFunc, func, log, done) {
+        const backoffCtx = new BackOff(BACKOFF_PARAMS);
+        let nbRetries = 0;
+        const startTime = Date.now();
+        const self = this;
+
+        function _handleRes(...args) {
+            const err = args[0];
+            if (!err) {
+                if (nbRetries > 0) {
+                    log.info(`succeeded to ${actionDesc}`,
+                             { entry: entry.getLogInfo(), nbRetries });
+                }
+                return done.apply(null, args);
+            }
+            if (!shouldRetryFunc(err)) {
+                return done(err);
+            }
+            const now = Date.now();
+            if (now > (startTime +
+                       self.repConfig.queueProcessor.retryTimeoutS * 1000)) {
+                log.error(`retried for too long to ${actionDesc}, giving up`,
+                          { entry: entry.getLogInfo(),
+                            nbRetries,
+                            retryTotalTime: `${(now - startTime) / 1000}s` });
+                return done(err);
+            }
+            const retryDelayMs = backoffCtx.duration();
+            log.info(`temporary failure to ${actionDesc}, ` +
+                     `scheduled retry`,
+                     { entry: entry.getLogInfo(),
+                       nbRetries, retryDelay: `${retryDelayMs}ms` });
+            nbRetries += 1;
+            return setTimeout(() => func(_handleRes), retryDelayMs);
+        }
+        func(_handleRes);
+    }
+
     _setupRoles(entry, log, cb) {
-        _retry('get bucket replication configuration', entry,
-               done => this._setupRolesOnce(entry, log, done), log, cb);
+        this._retry(
+            'get bucket replication configuration', entry,
+            // Rely on AWS SDK notion of retryable error to decide if
+            // we should set the entry replication status to FAILED
+            // (non retryable) or retry later.
+            err => err.retryable,
+            done => this._setupRolesOnce(entry, log, done), log, cb);
     }
 
     _setTargetAccountMd(destEntry, targetRole, log, cb) {
-        _retry('lookup target account attributes', destEntry,
-               done => this._setTargetAccountMdOnce(destEntry, targetRole,
-                                                    log, done), log, cb);
+        this._retry(
+            'lookup target account attributes', destEntry,
+            // this call uses our own Vault client which does not set
+            // the 'retryable' field
+            err => (err.InternalError || err.code === 'InternalError' ||
+                    err.ServiceUnavailable ||
+                    err.code === 'ServiceUnavailable'),
+            done => this._setTargetAccountMdOnce(destEntry, targetRole,
+                                                 log, done), log, cb);
     }
 
     _getAndPutPart(sourceEntry, destEntry, part, log, cb) {
-        _retry('stream part data', sourceEntry,
-               done => this._getAndPutPartOnce(sourceEntry, destEntry, part,
-                                               log, done), log, cb);
+        this._retry(
+            'stream part data', sourceEntry,
+            err => err.retryable,
+            done => this._getAndPutPartOnce(sourceEntry, destEntry, part,
+                                            log, done), log, cb);
     }
 
     _putMetadata(where, entry, log, cb) {
-        _retry(`update metadata on ${where}`, entry,
-               done => this._putMetadataOnce(where, entry, log, done),
-               log, cb);
+        this._retry(
+            `update metadata on ${where}`, entry,
+            err => err.retryable,
+            done => this._putMetadataOnce(where, entry, log, done),
+            log, cb);
+    }
+
+    _updateReplicationStatus(updatedSourceEntry, params, _done) {
+        this._retry(
+            'write replication status', updatedSourceEntry,
+            err => err.retryable,
+            done => this._updateReplicationStatusOnce(updatedSourceEntry,
+                                                      params, done),
+            params.log, _done);
     }
 
     _setupRolesOnce(entry, log, cb) {
@@ -551,37 +589,35 @@ class QueueProcessor {
         ], _handleReplicationOutcome);
     }
 
-    _updateReplicationStatus(updatedSourceEntry, params, _done) {
+    _updateReplicationStatusOnce(updatedSourceEntry, params, done) {
         const { log, reason } = params;
 
-        _retry('write replication status', updatedSourceEntry, done => {
-            const _doneUpdate = err => {
-                if (err) {
-                    log.error('an error occurred when writing replication ' +
-                              'status',
-                              { entry: updatedSourceEntry.getLogInfo(),
-                                replicationStatus:
-                                updatedSourceEntry.getReplicationStatus() });
-                    return done(err);
-                }
-                log.info('replication status updated',
-                         { entry: updatedSourceEntry.getLogInfo(),
-                           replicationStatus:
-                           updatedSourceEntry.getReplicationStatus(),
-                           reason });
-                return done();
-            };
-
-            if (this.backbeatSource !== null) {
-                return this._putMetadata(
-                    'source', updatedSourceEntry, log, _doneUpdate);
+        const _doneUpdate = err => {
+            if (err) {
+                log.error('an error occurred when writing replication ' +
+                          'status',
+                          { entry: updatedSourceEntry.getLogInfo(),
+                            replicationStatus:
+                            updatedSourceEntry.getReplicationStatus() });
+                return done(err);
             }
-            log.info('replication status update skipped',
+            log.info('replication status updated',
                      { entry: updatedSourceEntry.getLogInfo(),
                        replicationStatus:
-                       updatedSourceEntry.getReplicationStatus() });
+                       updatedSourceEntry.getReplicationStatus(),
+                       reason });
             return done();
-        }, log, _done);
+        };
+
+        if (this.backbeatSource !== null) {
+            return this._putMetadata(
+                'source', updatedSourceEntry, log, _doneUpdate);
+        }
+        log.info('replication status update skipped',
+                 { entry: updatedSourceEntry.getLogInfo(),
+                   replicationStatus:
+                   updatedSourceEntry.getReplicationStatus() });
+        return done();
     }
 
     start() {
