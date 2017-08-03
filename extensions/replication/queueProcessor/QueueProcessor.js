@@ -20,6 +20,7 @@ const QueueEntry = require('../utils/QueueEntry');
 const CredentialsManager = require('../../../credentials/CredentialsManager');
 
 const MPU_CONC_LIMIT = 10;
+const BACKOFF_PARAMS = { min: 1000, max: 300000, jitter: 0.1, factor: 1.5 };
 
 class _AccountAuthManager {
     constructor(authConfig, log) {
@@ -106,6 +107,33 @@ function _extractAccountIdFromRole(role) {
     return role.split(':')[4];
 }
 
+function _retry(actionDesc, entry, func, log, done) {
+    const backoffCtx = new BackOff(BACKOFF_PARAMS);
+    let nbRetries = 0;
+
+    function _handleRes(...args) {
+        const err = args[0];
+        // Rely on AWS SDK notion of retryable error to decide if we
+        // should set the entry replication status to FAILED (non
+        // retryable) or retry later.
+        if (err && err.retryable) {
+            const retryDelayMs = backoffCtx.duration();
+            log.info(`temporary failure to ${actionDesc}, scheduled retry`,
+                     { entry: entry.getLogInfo(),
+                       nbRetries,
+                       retryDelay: `${retryDelayMs}ms` });
+            nbRetries += 1;
+            return setTimeout(() => func(_handleRes), retryDelayMs);
+        }
+        if (nbRetries > 0) {
+            log.info(`succeeded to ${actionDesc}`,
+                     { entry: entry.getLogInfo(), nbRetries });
+        }
+        return done.apply(null, args);
+    }
+    func(_handleRes);
+}
+
 class QueueProcessor {
 
     /**
@@ -148,8 +176,7 @@ class QueueProcessor {
         this.s3destAuthManager = null;
         this.S3source = null;
         this.backbeatSource = null;
-        this.backbeatDestData = null;
-        this.backbeatDestMetadata = null;
+        this.backbeatDest = null;
 
         // TODO: for SSL support, create HTTPS agents instead
         this.sourceHTTPAgent = new http.Agent({ keepAlive: true });
@@ -164,6 +191,29 @@ class QueueProcessor {
     }
 
     _setupRoles(entry, log, cb) {
+        _retry('get bucket replication configuration', entry,
+               done => this._setupRolesOnce(entry, log, done), log, cb);
+    }
+
+    _setTargetAccountMd(destEntry, targetRole, log, cb) {
+        _retry('lookup target account attributes', destEntry,
+               done => this._setTargetAccountMdOnce(destEntry, targetRole,
+                                                    log, done), log, cb);
+    }
+
+    _getAndPutPart(sourceEntry, destEntry, part, log, cb) {
+        _retry('stream part data', sourceEntry,
+               done => this._getAndPutPartOnce(sourceEntry, destEntry, part,
+                                               log, done), log, cb);
+    }
+
+    _putMetadata(where, entry, log, cb) {
+        _retry(`update metadata on ${where}`, entry,
+               done => this._putMetadataOnce(where, entry, log, done),
+               log, cb);
+    }
+
+    _setupRolesOnce(entry, log, cb) {
         log.debug('getting bucket replication',
                   { entry: entry.getLogInfo() });
         const entryRolesString = entry.getReplicationRoles();
@@ -243,7 +293,7 @@ class QueueProcessor {
             });
     }
 
-    _setTargetAccountMd(destEntry, targetRole, log, cb) {
+    _setTargetAccountMdOnce(destEntry, targetRole, log, cb) {
         log.debug('changing target account owner',
                   { entry: destEntry.getLogInfo() });
         const targetAccountId = _extractAccountIdFromRole(targetRole);
@@ -268,78 +318,83 @@ class QueueProcessor {
             });
     }
 
+
     _getAndPutData(sourceEntry, destEntry, log, cb) {
-        log.debug('getting data', { entry: sourceEntry.getLogInfo() });
+        log.debug('replicating data', { entry: sourceEntry.getLogInfo() });
         const locations = sourceEntry.getLocation();
         return async.mapLimit(locations, MPU_CONC_LIMIT, (part, done) => {
-            const doneOnce = jsutil.once(done);
-            if (sourceEntry.getDataStoreETag(part) === undefined) {
-                log.error('cannot replicate object without dataStoreETag ' +
-                          'property',
-                          { method: 'QueueProcessor._getAndPutData',
-                            entry: destEntry.getLogInfo() });
-                return doneOnce(errors.InvalidObjectState);
-            }
-            const partNumber = sourceEntry.getPartNumber(part);
-            const req = this.S3source.getObject({
-                Bucket: sourceEntry.getBucket(),
-                Key: sourceEntry.getObjectKey(),
-                VersionId: sourceEntry.getEncodedVersionId(),
-                PartNumber: partNumber,
-            });
-            req.on('error', err => {
-                // eslint-disable-next-line no-param-reassign
-                err.origin = 'source';
-                log.error('an error occurred on getObject from S3',
-                          { method: 'QueueProcessor._getAndPutData',
-                            entry: sourceEntry.getLogInfo(),
-                            origin: this.sourceConfig.s3,
-                            error: err.message,
-                            httpStatus: err.statusCode });
-                return doneOnce(err);
-            });
-            const incomingMsg = req.createReadStream();
-            incomingMsg.on('error', err => {
-                // eslint-disable-next-line no-param-reassign
-                err.origin = 'source';
-                log.error('an error occurred when streaming data from S3',
-                          { method: 'QueueProcessor._getAndPutData',
-                            entry: destEntry.getLogInfo(),
-                            error: err.message });
-                return doneOnce(err);
-            });
-            log.debug('putting data', { entry: destEntry.getLogInfo() });
-            return this.backbeatDestData.putData({
-                Bucket: destEntry.getBucket(),
-                Key: destEntry.getObjectKey(),
-                CanonicalID: destEntry.getOwnerCanonicalId(),
-                ContentLength: destEntry.getPartSize(part),
-                ContentMD5: destEntry.getPartETag(part),
-                Body: incomingMsg,
-            }, (err, data) => {
-                if (err) {
-                    // eslint-disable-next-line no-param-reassign
-                    err.origin = 'target';
-                    log.error('an error occurred on putData to S3',
-                              { method: 'QueueProcessor._getAndPutData',
-                                entry: destEntry.getLogInfo(),
-                                origin: this.destConfig.s3,
-                                error: err.message });
-                    return doneOnce(err);
-                }
-                return doneOnce(null,
-                    destEntry.buildLocationKey(part, data.Location[0]));
-            });
+            this._getAndPutPart(sourceEntry, destEntry, part, log, done);
         }, cb);
     }
 
-    _putMetadata(where, entry, log, cb) {
+    _getAndPutPartOnce(sourceEntry, destEntry, part, log, done) {
+        const doneOnce = jsutil.once(done);
+        if (sourceEntry.getDataStoreETag(part) === undefined) {
+            log.error('cannot replicate object without dataStoreETag ' +
+                      'property',
+                      { method: 'QueueProcessor._getAndPutData',
+                        entry: destEntry.getLogInfo() });
+            return doneOnce(errors.InvalidObjectState);
+        }
+        const partNumber = sourceEntry.getPartNumber(part);
+        const req = this.S3source.getObject({
+            Bucket: sourceEntry.getBucket(),
+            Key: sourceEntry.getObjectKey(),
+            VersionId: sourceEntry.getEncodedVersionId(),
+            PartNumber: partNumber,
+        });
+        req.on('error', err => {
+            // eslint-disable-next-line no-param-reassign
+            err.origin = 'source';
+            log.error('an error occurred on getObject from S3',
+                      { method: 'QueueProcessor._getAndPutData',
+                        entry: sourceEntry.getLogInfo(),
+                        origin: this.sourceConfig.s3,
+                        error: err.message,
+                        httpStatus: err.statusCode });
+            return doneOnce(err);
+        });
+        const incomingMsg = req.createReadStream();
+        incomingMsg.on('error', err => {
+            // eslint-disable-next-line no-param-reassign
+            err.origin = 'source';
+            log.error('an error occurred when streaming data from S3',
+                      { method: 'QueueProcessor._getAndPutData',
+                        entry: destEntry.getLogInfo(),
+                        error: err.message });
+            return doneOnce(err);
+        });
+        log.debug('putting data', { entry: destEntry.getLogInfo() });
+        return this.backbeatDest.putData({
+            Bucket: destEntry.getBucket(),
+            Key: destEntry.getObjectKey(),
+            CanonicalID: destEntry.getOwnerCanonicalId(),
+            ContentLength: destEntry.getPartSize(part),
+            ContentMD5: destEntry.getPartETag(part),
+            Body: incomingMsg,
+        }, (err, data) => {
+            if (err) {
+                // eslint-disable-next-line no-param-reassign
+                err.origin = 'target';
+                log.error('an error occurred on putData to S3',
+                          { method: 'QueueProcessor._getAndPutData',
+                            entry: destEntry.getLogInfo(),
+                            origin: this.destConfig.s3,
+                            error: err.message });
+                return doneOnce(err);
+            }
+            return doneOnce(null,
+                            destEntry.buildLocationKey(part, data.Location[0]));
+        });
+    }
+
+    _putMetadataOnce(where, entry, log, cb) {
         log.debug('putting metadata',
                   { where, entry: entry.getLogInfo(),
                     replicationStatus: entry.getReplicationStatus() });
         const cbOnce = jsutil.once(cb);
         const target = where === 'source' ?
-                  this.backbeatSource : this.backbeatDestMetadata;
+                  this.backbeatSource : this.backbeatDest;
         const mdBlob = entry.getMetadataBlob();
         target.putMetadata({
             Bucket: entry.getBucket(),
@@ -366,6 +421,10 @@ class QueueProcessor {
             this._createAuthManager(this.sourceConfig.auth, sourceRole, log);
         this.s3destAuthManager =
             this._createAuthManager(this.destConfig.auth, targetRole, log);
+
+        // Disable retries, use our own retry policy (mandatory for
+        // putData route in order to fetch data again from source).
+
         this.S3source = new AWS.S3({
             endpoint: `${this.sourceConfig.s3.transport}://` +
                 `${this.sourceConfig.s3.host}:${this.sourceConfig.s3.port}`,
@@ -375,6 +434,7 @@ class QueueProcessor {
             s3ForcePathStyle: true,
             signatureVersion: 'v4',
             httpOptions: { agent: this.sourceHTTPAgent },
+            maxRetries: 0,
         });
         this.backbeatSource = new BackbeatClient({
             endpoint: `${this.sourceConfig.s3.transport}://` +
@@ -383,26 +443,17 @@ class QueueProcessor {
             this.s3sourceAuthManager.getCredentials(),
             sslEnabled: true,
             httpOptions: { agent: this.sourceHTTPAgent },
-        });
-
-        this.backbeatDestData = new BackbeatClient({
-            endpoint: `${this.destConfig.s3.transport}://` +
-                `${this.destConfig.s3.host}:${this.destConfig.s3.port}`,
-            credentials:
-            this.s3destAuthManager.getCredentials(),
-            sslEnabled: true,
-            httpOptions: { agent: this.destHTTPAgent },
-            // disable retries for data route (need to fetch data
-            // again from source)
             maxRetries: 0,
         });
-        this.backbeatDestMetadata = new BackbeatClient({
+
+        this.backbeatDest = new BackbeatClient({
             endpoint: `${this.destConfig.s3.transport}://` +
                 `${this.destConfig.s3.host}:${this.destConfig.s3.port}`,
             credentials:
             this.s3destAuthManager.getCredentials(),
             sslEnabled: true,
             httpOptions: { agent: this.destHTTPAgent },
+            maxRetries: 0,
         });
     }
 
@@ -425,13 +476,10 @@ class QueueProcessor {
                       { error: sourceEntry.error });
             return process.nextTick(() => done(errors.InternalError));
         }
-        const backoffCtx = new BackOff({ min: 1000, max: 300000,
-                                         jitter: 0.1, factor: 1.5 });
-        return this._tryProcessQueueEntry(sourceEntry, backoffCtx, log,
-                                          done);
+        return this._processQueueEntry(sourceEntry, log, done);
     }
 
-    _tryProcessQueueEntry(sourceEntry, backoffCtx, log, done) {
+    _processQueueEntry(sourceEntry, log, done) {
         const destEntry = sourceEntry.toReplicaEntry();
 
         log.debug('processing entry',
@@ -442,21 +490,9 @@ class QueueProcessor {
                 log.debug('replication succeeded for object, updating ' +
                           'source replication status to COMPLETED',
                           { entry: sourceEntry.getLogInfo() });
-                return this._tryUpdateReplicationStatus(
-                    sourceEntry.toCompletedEntry(), { backoffCtx, log },
-                    done);
+                return this._updateReplicationStatus(
+                    sourceEntry.toCompletedEntry(), { log }, done);
             }
-            // Rely on AWS SDK notion of retryable error to decide if
-            // we should set the entry replication status to FAILED
-            // (non retryable) or retry later.
-            if (err.retryable) {
-                log.warn('temporary failure to replicate object',
-                         { entry: sourceEntry.getLogInfo(),
-                           error: err });
-                return this._retryProcessQueueEntry(sourceEntry, backoffCtx,
-                                                    log, done);
-            }
-
             if (err.BadRole ||
                 (err.origin === 'source' &&
                  (err.NoSuchEntity || err.code === 'NoSuchEntity' ||
@@ -473,9 +509,9 @@ class QueueProcessor {
                       { failMethod: err.method,
                         entry: sourceEntry.getLogInfo(),
                         error: err.description });
-            return this._tryUpdateReplicationStatus(
+            return this._updateReplicationStatus(
                 sourceEntry.toFailedEntry(),
-                { backoffCtx, log, reason: err.description }, done);
+                { log, reason: err.description }, done);
         };
 
         if (sourceEntry.isDeleteMarker()) {
@@ -515,60 +551,37 @@ class QueueProcessor {
         ], _handleReplicationOutcome);
     }
 
-    _tryUpdateReplicationStatus(updatedSourceEntry, params, done) {
-        const { backoffCtx, log, reason } = params;
-        const _doneUpdate = err => {
-            if (!err) {
+    _updateReplicationStatus(updatedSourceEntry, params, _done) {
+        const { log, reason } = params;
+
+        _retry('write replication status', updatedSourceEntry, done => {
+            const _doneUpdate = err => {
+                if (err) {
+                    log.error('an error occurred when writing replication ' +
+                              'status',
+                              { entry: updatedSourceEntry.getLogInfo(),
+                                replicationStatus:
+                                updatedSourceEntry.getReplicationStatus() });
+                    return done(err);
+                }
                 log.info('replication status updated',
                          { entry: updatedSourceEntry.getLogInfo(),
                            replicationStatus:
                            updatedSourceEntry.getReplicationStatus(),
                            reason });
                 return done();
+            };
+
+            if (this.backbeatSource !== null) {
+                return this._putMetadata(
+                    'source', updatedSourceEntry, log, _doneUpdate);
             }
-            log.error('an error occurred when writing replication ' +
-                      'status',
-                      { entry: updatedSourceEntry.getLogInfo(),
-                        replicationStatus:
-                        updatedSourceEntry.getReplicationStatus() });
-            // Rely on AWS SDK notion of retryable error to decide if
-            // we should retry or give up updating the status.
-            if (err.retryable) {
-                return this._retryUpdateReplicationStatus(
-                    updatedSourceEntry, backoffCtx, log, done);
-            }
+            log.info('replication status update skipped',
+                     { entry: updatedSourceEntry.getLogInfo(),
+                       replicationStatus:
+                       updatedSourceEntry.getReplicationStatus() });
             return done();
-        };
-
-        if (this.backbeatSource !== null) {
-            return this._putMetadata('source',
-                                     updatedSourceEntry, log, _doneUpdate);
-        }
-        log.info('replication status update skipped',
-                 { entry: updatedSourceEntry.getLogInfo(),
-                   replicationStatus:
-                   updatedSourceEntry.getReplicationStatus() });
-        return done();
-    }
-
-    _retryProcessQueueEntry(sourceEntry, backoffCtx, log, done) {
-        const retryDelayMs = backoffCtx.duration();
-        log.info('scheduled retry of entry replication',
-                 { entry: sourceEntry.getLogInfo(),
-                   retryDelay: `${retryDelayMs}ms` });
-        setTimeout(this._tryProcessQueueEntry.bind(
-            this, sourceEntry, backoffCtx, log, done),
-                   retryDelayMs);
-    }
-
-    _retryUpdateReplicationStatus(updatedSourceEntry, params, done) {
-        const { backoffCtx, log } = params;
-        const retryDelayMs = backoffCtx.duration();
-        log.info('scheduled retry of replication status update',
-                 { entry: updatedSourceEntry.getLogInfo(),
-                   retryDelay: `${retryDelayMs}ms` });
-        setTimeout(this._tryUpdateReplicationStatus.bind(
-            this, updatedSourceEntry, params, done), retryDelayMs);
+        }, log, _done);
     }
 
     start() {
