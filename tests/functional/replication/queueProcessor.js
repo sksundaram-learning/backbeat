@@ -569,7 +569,10 @@ describe('queue processor functional tests with mocking', () => {
                                port: 7777 } },
               s3: { host: constants.target.s3,
                     port: 7777, transport: 'http' } },
-            {} /* repConfig not needed */,
+            { queueProcessor: {
+                retryTimeoutS: 5,
+                // groupId not needed for tests
+            }},
             { logLevel: 'info', dumpLevel: 'error' });
 
         // don't call start() on the queue processor, so that we don't
@@ -614,7 +617,7 @@ describe('queue processor functional tests with mocking', () => {
     });
 
     describe('error paths', function errorPaths() {
-        this.timeout(10000); // to leave room for retry delays
+        this.timeout(15000); // to leave room for retry delays and timeout
 
         describe('source Vault errors', () => {
             ['assumeRoleBackbeat'].forEach(action => {
@@ -728,6 +731,25 @@ describe('queue processor functional tests with mocking', () => {
                      });
                  });
              });
+
+            ['getAccountsCanonicalIds'].forEach(action => {
+                [errors.InternalError].forEach(error => {
+                    it(`should retry on ${error.code} (${error.message}) ` +
+                    `from target Vault on ${action}`, done => {
+                        s3mock.installVaultErrorResponder(
+                            `target.vault.${action}`, error, { once: true });
+
+                        queueProcessor.processKafkaEntry(
+                            s3mock.getParam('kafkaEntry'), err => {
+                                assert.ifError(err);
+                                assert(s3mock.hasPutTargetData);
+                                assert(s3mock.hasPutTargetMd);
+                                assert(s3mock.hasPutSourceMd);
+                                done();
+                            });
+                    });
+                });
+            });
         });
 
         describe('target S3 errors', () => {
@@ -767,6 +789,24 @@ describe('queue processor functional tests with mocking', () => {
                             });
                     });
                 });
+            });
+        });
+
+        describe('retry behavior', () => {
+            it('should give up retries after configured timeout (5s)',
+            done => {
+                s3mock.installS3ErrorResponder(`source.s3.getObject`,
+                                               errors.InternalError);
+                s3mock.setExpectedReplicationStatus('FAILED');
+
+                queueProcessor.processKafkaEntry(
+                    s3mock.getParam('kafkaEntry'), err => {
+                        assert.ifError(err);
+                        assert(!s3mock.hasPutTargetData);
+                        assert(!s3mock.hasPutTargetMd);
+                        assert(s3mock.hasPutSourceMd);
+                        done();
+                    });
             });
         });
     });

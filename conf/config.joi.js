@@ -52,6 +52,7 @@ const joiSchema = {
             },
             queueProcessor: {
                 groupId: joi.string().required(),
+                retryTimeoutS: joi.number().default(300),
             },
         },
     },
